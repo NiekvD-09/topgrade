@@ -417,138 +417,13 @@ impl Sudo {
             return Ok(ctx.execute(command));
         }
 
-        let mut args: Vec<String> = Vec::new();
-
-        if opts.login_shell {
-            match self.kind {
-                SudoKind::Sudo => {
-                    args.push("-i".into());
-                }
-                SudoKind::Gsudo => {
-                    // By default, gsudo runs all commands inside a shell. If login_shell
-                    // is *not* specified, we add `-d` to run outside of a shell - see below.
-                }
-                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Pkexec | SudoKind::Run0 | SudoKind::Please => {
-                    return Err(UnsupportedSudo {
-                        sudo_kind: self.kind,
-                        option: "login_shell",
-                    }
-                    .into());
-                }
-                SudoKind::Null => unreachable!(),
-            }
-        } else if let SudoKind::Gsudo = self.kind {
-            // The `-d` (direct) flag disables shell detection, running the command directly
-            // rather than through the current shell.
-            // Additionally, if the current shell is pwsh >= 7.3.0, then not including this
-            // gives errors if the command to run has spaces in it: see
-            // https://github.com/gerardog/gsudo/issues/297
-            args.push("-d".into());
-        }
-
-        let mut preserve_env = opts.preserve_env;
-        // The `--env` arguments are set globally in `main.rs`, but sudo by default
-        // does not pass these environment variables through unless explicitly told to.
-        // So we add them here to the preserve_env list.
-        let cfg_env_vars = ctx.config().env_variables();
-        if !cfg_env_vars.is_empty() {
-            let cfg_env_var_keys = cfg_env_vars.iter().map(|(key, _value)| key.as_str());
-            // merge the user-specified env vars with the opts.preserve_env
-            match preserve_env {
-                SudoPreserveEnv::All => {}
-                SudoPreserveEnv::Some(ref mut env_set) => env_set.extend(cfg_env_var_keys),
-                SudoPreserveEnv::None => preserve_env = SudoPreserveEnv::Some(cfg_env_var_keys.collect()),
-            }
-        }
-        match preserve_env {
-            SudoPreserveEnv::All => match self.kind {
-                SudoKind::Sudo => {
-                    args.push("-E".into());
-                }
-                SudoKind::Gsudo => {
-                    args.push("--copyEV".into());
-                }
-                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Pkexec | SudoKind::Run0 | SudoKind::Please => {
-                    return Err(UnsupportedSudo {
-                        sudo_kind: self.kind,
-                        option: "preserve_env",
-                    }
-                    .into());
-                }
-                SudoKind::Null => unreachable!(),
-            },
-            SudoPreserveEnv::Some(vars) => match self.kind {
-                SudoKind::Sudo => {
-                    args.push(format!("--preserve-env={}", vars.iter().join(",")));
-                }
-                SudoKind::Run0 => {
-                    for env in vars {
-                        args.push(format!("--setenv={}", env));
-                    }
-                }
-                SudoKind::Please => {
-                    args.push("-a".into());
-                    args.push(vars.iter().join(","));
-                }
-                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Gsudo | SudoKind::Pkexec => {
-                    return Err(UnsupportedSudo {
-                        sudo_kind: self.kind,
-                        option: "preserve_env_list",
-                    }
-                    .into());
-                }
-                SudoKind::Null => unreachable!(),
-            },
-            SudoPreserveEnv::None => {}
-        }
-
-        if opts.set_home {
-            match self.kind {
-                SudoKind::Sudo => {
-                    args.push("-H".into());
-                }
-                // This is already the default behavior for run0
-                SudoKind::Run0 => {}
-                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Gsudo | SudoKind::Pkexec | SudoKind::Please => {
-                    return Err(UnsupportedSudo {
-                        sudo_kind: self.kind,
-                        option: "set_home",
-                    }
-                    .into());
-                }
-                SudoKind::Null => unreachable!(),
-            }
-        }
-
-        if let Some(user) = opts.user {
-            match self.kind {
-                SudoKind::Sudo => {
-                    args.push("-u".into());
-                    args.push(user.into());
-                }
-                SudoKind::Doas | SudoKind::Gsudo | SudoKind::Run0 | SudoKind::Please => {
-                    args.push("-u".into());
-                    args.push(user.into());
-                }
-                SudoKind::Pkexec => {
-                    args.push("--user".into());
-                    args.push(user.into());
-                }
-                SudoKind::WinSudo => {
-                    // Windows sudo is the only one that doesn't have a `-u` flag
-                    return Err(UnsupportedSudo {
-                        sudo_kind: self.kind,
-                        option: "user",
-                    }
-                    .into());
-                }
-                SudoKind::Null => unreachable!(),
-            }
-        }
-
         // self.path is only None for null sudo, which we've handled above
         let mut cmd = ctx.execute(self.path.as_ref().unwrap());
-        cmd.args(args).arg(command);
+        cmd.args(self.kind.login_shell_flags(opts.login_shell)?)
+            .args(self.kind.preserve_env_flags(ctx, opts.preserve_env)?)
+            .args(self.kind.set_home_flags(opts.set_home)?)
+            .args(self.kind.user_flags(opts.user)?)
+            .arg(command);
 
         Ok(cmd)
     }
@@ -616,6 +491,146 @@ impl SudoKind {
         match self.binary_name() {
             Some(name) => which(name),
             None => None,
+        }
+    }
+
+    fn login_shell_flags(self, login_shell: bool) -> Result<Vec<String>> {
+        if opts.login_shell {
+            match self.kind {
+                SudoKind::Sudo => {
+                    args.push("-i".into());
+                }
+                SudoKind::Gsudo => {
+                    // By default, gsudo runs all commands inside a shell. If login_shell
+                    // is *not* specified, we add `-d` to run outside of a shell - see below.
+                }
+                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Pkexec | SudoKind::Run0 | SudoKind::Please => {
+                    return Err(UnsupportedSudo {
+                        sudo_kind: self.kind,
+                        option: "login_shell",
+                    }
+                    .into());
+                }
+                SudoKind::Null => unreachable!(),
+            }
+        } else if let SudoKind::Gsudo = self.kind {
+            // The `-d` (direct) flag disables shell detection, running the command directly
+            // rather than through the current shell.
+            // Additionally, if the current shell is pwsh >= 7.3.0, then not including this
+            // gives errors if the command to run has spaces in it: see
+            // https://github.com/gerardog/gsudo/issues/297
+            args.push("-d".into());
+        }
+    }
+
+    fn preserve_env_flags<'a>(
+        self,
+        ctx: &'a ExecutionContext<'a>,
+        mut preserve_env: SudoPreserveEnv<'a>,
+    ) -> Result<Vec<String>> {
+               let mut preserve_env = opts.preserve_env;
+        // The `--env` arguments are set globally in `main.rs`, but sudo by default
+        // does not pass these environment variables through unless explicitly told to.
+        // So we add them here to the preserve_env list.
+        let cfg_env_vars = ctx.config().env_variables();
+        if !cfg_env_vars.is_empty() {
+            let cfg_env_var_keys = cfg_env_vars.iter().map(|(key, _value)| key.as_str());
+            // merge the user-specified env vars with the opts.preserve_env
+            match preserve_env {
+                SudoPreserveEnv::All => {}
+                SudoPreserveEnv::Some(ref mut env_set) => env_set.extend(cfg_env_var_keys),
+                SudoPreserveEnv::None => preserve_env = SudoPreserveEnv::Some(cfg_env_var_keys.collect()),
+            }
+        }
+        match preserve_env {
+            SudoPreserveEnv::All => match self.kind {
+                SudoKind::Sudo => {
+                    args.push("-E".into());
+                }
+                SudoKind::Gsudo => {
+                    args.push("--copyEV".into());
+                }
+                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Pkexec | SudoKind::Run0 | SudoKind::Please => {
+                    return Err(UnsupportedSudo {
+                        sudo_kind: self.kind,
+                        option: "preserve_env",
+                    }
+                    .into());
+                }
+                SudoKind::Null => unreachable!(),
+            },
+            SudoPreserveEnv::Some(vars) => match self.kind {
+                SudoKind::Sudo => {
+                    args.push(format!("--preserve-env={}", vars.iter().join(",")));
+                }
+                SudoKind::Run0 => {
+                    for env in vars {
+                        args.push(format!("--setenv={}", env));
+                    }
+                }
+                SudoKind::Please => {
+                    args.push("-a".into());
+                    args.push(vars.iter().join(","));
+                }
+                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Gsudo | SudoKind::Pkexec => {
+                    return Err(UnsupportedSudo {
+                        sudo_kind: self.kind,
+                        option: "preserve_env_list",
+                    }
+                    .into());
+                }
+                SudoKind::Null => unreachable!(),
+            },
+            SudoPreserveEnv::None => {}
+        }
+    }
+
+    fn set_home_flags(self, set_home: bool) -> Result<Vec<String>> {
+        if opts.set_home {
+            match self.kind {
+                SudoKind::Sudo => {
+                    args.push("-H".into());
+                }
+                // This is already the default behavior for run0
+                SudoKind::Run0 => {}
+                SudoKind::Doas | SudoKind::WinSudo | SudoKind::Gsudo | SudoKind::Pkexec | SudoKind::Please => {
+                    return Err(UnsupportedSudo {
+                        sudo_kind: self.kind,
+                        option: "set_home",
+                    }
+                    .into());
+                }
+                SudoKind::Null => unreachable!(),
+            }
+        }
+
+    }
+
+    fn user_flags(self, user: Option<&str>) -> Result<Vec<String>> {
+        if let Some(user) = opts.user {
+            match self.kind {
+                SudoKind::Sudo => {
+                    args.push("-u".into());
+                    args.push(user.into());
+                }
+                SudoKind::Doas | SudoKind::Gsudo | SudoKind::Run0 | SudoKind::Please => {
+                    args.push("-u".into());
+                    args.push(user.into());
+                }
+                SudoKind::Pkexec => {
+                    args.push("--user".into());
+                    args.push(user.into());
+                }
+                SudoKind::WinSudo => {
+                    // Windows sudo is the only one that doesn't have a `-u` flag
+                    return Err(UnsupportedSudo {
+                        sudo_kind: self.kind,
+                        option: "user",
+                    }
+                    .into());
+                }
+                SudoKind::Null => unreachable!(),
+            }
         }
     }
 }
